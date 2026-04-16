@@ -323,7 +323,10 @@ export default function FlowBuilder({ onSave, onCancel }) {
       </div>
 
       {/* Desktop: React Flow canvas */}
-      <div className="hidden sm:block flex-1" style={{ height: 'calc(100vh - 72px)' }}>
+      <div
+        className="hidden sm:block flex-1"
+        style={{ height: 'calc(100vh - 72px)', width: '100%' }}
+      >
         <ReactFlow
           nodes={displayNodes}
           edges={edges}
@@ -331,6 +334,9 @@ export default function FlowBuilder({ onSave, onCancel }) {
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
           nodeTypes={nodeTypes}
+          nodesDraggable
+          nodesConnectable
+          elementsSelectable
           fitView
           proOptions={{ hideAttribution: true }}
           className="bg-slate-950"
