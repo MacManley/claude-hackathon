@@ -42,6 +42,25 @@ const INITIAL_JOB_FORM = {
   interviewFocus: '',
 };
 
+const DEMO_JOB = {
+  roleTitle: 'Senior Software Engineer',
+  level: 'Senior, 5+ years',
+  location: 'Dublin, Ireland',
+  employmentType: 'Full-time',
+  remotePolicy: 'Hybrid – 2 days in office',
+  salaryRange: '€85,000 – €110,000',
+  team: 'Core Platform team, building developer tooling and internal APIs',
+  responsibilities:
+    'Design and ship scalable backend services; lead code reviews and mentor junior engineers; collaborate with product and design on architecture decisions; improve CI/CD pipelines and observability',
+  requirements:
+    '5+ years building production software; strong TypeScript or Python skills; experience with REST and GraphQL APIs; solid understanding of distributed systems and databases',
+  niceToHave:
+    'Experience with Kubernetes or AWS; open-source contributions; previous startup experience',
+  techStack: 'TypeScript; Node.js; PostgreSQL; Redis; Docker; AWS; GitHub Actions',
+  interviewFocus:
+    'System design, code quality, collaborative problem-solving, past technical challenges',
+};
+
 const QUESTION_SYSTEM = (jobDescription, n) =>
   `You are a senior interviewer at the company hiring for this role:
 ${jobDescription}. Generate ONE interview question appropriate for question number ${n} of 5. Mix across: background/motivation (Q1), behavioural STAR (Q2), role-specific technical (Q3), situational (Q4), challenging curveball (Q5). Return ONLY the question text, no preamble, no numbering, no quotation marks. Keep it realistic and concise.`;
@@ -234,11 +253,23 @@ function ErrorPanel({ message, onRetry, onDismiss }) {
 
 export default function App() {
   const [screen, setScreen] = useState('landing');
+  const [isDemoMode, setIsDemoMode] = useState(false);
   const [jobForm, setJobForm] = useState(INITIAL_JOB_FORM);
   const [jobPostingText, setJobPostingText] = useState('');
   const [jobPostingUrl, setJobPostingUrl] = useState('');
   const [isExtracting, setIsExtracting] = useState(false);
   const [extractionNote, setExtractionNote] = useState('');
+
+  const toggleDemoMode = useCallback((enabled) => {
+    setIsDemoMode(enabled);
+    if (enabled) {
+      setJobForm(DEMO_JOB);
+      setJobPostingUrl('https://cadence.wd1.myworkdayjobs.com/External_Careers/job/CORK-01/Intern_R52784?source=LinkedIn');
+    } else {
+      setJobForm(INITIAL_JOB_FORM);
+      setJobPostingUrl('');
+    }
+  }, []);
 
   const [questionIndex, setQuestionIndex] = useState(0);
   const [currentQuestion, setCurrentQuestion] = useState('');
@@ -859,6 +890,9 @@ export default function App() {
   ]);
 
   const endSession = useCallback(async () => {
+    // Pause immediately so the auto-listen useEffect doesn't restart recording
+    isPausedRef.current = true;
+    setIsPaused(true);
     cancelSpeech();
     if (autoAdvanceRef.current) {
       clearTimeout(autoAdvanceRef.current);
@@ -897,6 +931,7 @@ export default function App() {
   const restart = useCallback(() => {
     cancelSpeech();
     setScreen('landing');
+    setIsDemoMode(false);
     setJobForm(INITIAL_JOB_FORM);
     setJobPostingText('');
     setJobPostingUrl('');
@@ -933,6 +968,30 @@ export default function App() {
           </div>
 
           <div className="bg-slate-900/60 border border-slate-800/60 rounded-2xl p-6 shadow-xl shadow-black/20">
+            {/* Demo mode toggle */}
+            <div className="flex items-center justify-between mb-5 pb-4 border-b border-slate-800/60">
+              <div>
+                <p className="text-sm font-medium text-slate-200">Try a demo job</p>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Auto-fills a Senior Software Engineer role so you can start instantly.
+                </p>
+              </div>
+              <button
+                role="switch"
+                aria-checked={isDemoMode}
+                onClick={() => toggleDemoMode(!isDemoMode)}
+                className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
+                  isDemoMode ? 'bg-teal-400' : 'bg-slate-700'
+                }`}
+              >
+                <span
+                  className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-lg transition-transform ${
+                    isDemoMode ? 'translate-x-5' : 'translate-x-0'
+                  }`}
+                />
+              </button>
+            </div>
+
             <div className="grid md:grid-cols-2 gap-4">
               <div>
                 <label className="block text-xs font-medium text-slate-400 mb-2">
