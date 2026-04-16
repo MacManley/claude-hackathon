@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import FlowBuilder from './FlowBuilder';
 
 const MODEL = 'claude-sonnet-4-20250514';
 const TOTAL_QUESTIONS = 5;
@@ -63,9 +64,14 @@ const DEMO_JOB = {
     'System design, code quality, collaborative problem-solving, past technical challenges',
 };
 
-const QUESTION_SYSTEM = (jobDescription, n) =>
-  `You are a senior interviewer at the company hiring for this role:
+const QUESTION_SYSTEM = (jobDescription, n, stagePrompt) => {
+  if (stagePrompt) {
+    return `You are a senior interviewer at the company hiring for this role:
+${jobDescription}. This is question ${n} of the interview. The interviewer's directive for this stage is: "${stagePrompt}". Generate ONE interview question that follows this directive. Return ONLY the question text, no preamble, no numbering, no quotation marks. Keep it realistic and concise.`;
+  }
+  return `You are a senior interviewer at the company hiring for this role:
 ${jobDescription}. Generate ONE interview question appropriate for question number ${n} of 5. Mix across: background/motivation (Q1), behavioural STAR (Q2), role-specific technical (Q3), situational (Q4), challenging curveball (Q5). Return ONLY the question text, no preamble, no numbering, no quotation marks. Keep it realistic and concise.`;
+};
 
 const FEEDBACK_SYSTEM = (jobDescription, question, answer) =>
   `You are a direct, experienced interview coach. The job: ${jobDescription}. The question asked: ${question}. The candidate's answer: ${answer}. Respond in strict JSON with this exact shape:
@@ -256,6 +262,7 @@ function ErrorPanel({ message, onRetry, onDismiss }) {
 export default function App() {
   const [screen, setScreen] = useState('landing');
   const [isDemoMode, setIsDemoMode] = useState(false);
+  const [customFlowStages, setCustomFlowStages] = useState(null);
   const [jobForm, setJobForm] = useState(INITIAL_JOB_FORM);
   const [jobPostingText, setJobPostingText] = useState('');
   const [jobPostingUrl, setJobPostingUrl] = useState('');
@@ -315,6 +322,7 @@ export default function App() {
   const onNextQuestionRef = useRef(null);
 
   const jobDescription = buildJobDescription(jobForm, jobPostingText);
+  const totalQuestions = customFlowStages ? customFlowStages.length : TOTAL_QUESTIONS;
 
   const hasMinimumInfo =
     !!jobDescription.trim() &&
@@ -494,9 +502,10 @@ export default function App() {
       }
       setAutoAdvanceReady(false);
       try {
+        const stagePrompt = customFlowStages?.[n] || null;
         const text = await callClaude({
-          system: QUESTION_SYSTEM(jobDescription, n + 1),
-          user: `Please provide question ${n + 1} of 5 now.`,
+          system: QUESTION_SYSTEM(jobDescription, n + 1, stagePrompt),
+          user: `Please provide question ${n + 1} of ${totalQuestions} now.`,
           maxTokens: 1024,
         });
         const cleaned = (text || '').trim().replace(/^["'“]|["'”]$/g, '');
@@ -530,7 +539,7 @@ export default function App() {
         });
       }
     },
-    [jobDescription, resetTranscripts, speak, startListening]
+    [jobDescription, resetTranscripts, speak, startListening, customFlowStages, totalQuestions]
   );
 
   const scheduleAutoAdvance = useCallback(() => {
@@ -822,7 +831,7 @@ export default function App() {
   const onNextQuestion = useCallback(async () => {
     setAutoAdvanceReady(false);
     const nextIndex = questionIndex + 1;
-    if (nextIndex >= TOTAL_QUESTIONS) {
+    if (nextIndex >= totalQuestions) {
       const pairs = questions
         .map((q, i) => ({
           question: q,
@@ -834,7 +843,7 @@ export default function App() {
     } else {
       await fetchQuestion(nextIndex);
     }
-  }, [answers, fetchQuestion, fetchSummary, feedbacks, questionIndex, questions]);
+  }, [answers, fetchQuestion, fetchSummary, feedbacks, questionIndex, questions, totalQuestions]);
 
   useEffect(() => {
     onNextQuestionRef.current = onNextQuestion;
@@ -934,6 +943,7 @@ export default function App() {
     cancelSpeech();
     setScreen('landing');
     setIsDemoMode(false);
+    setCustomFlowStages(null);
     setJobForm(INITIAL_JOB_FORM);
     setJobPostingText('');
     setJobPostingUrl('');
@@ -954,6 +964,18 @@ export default function App() {
     setQuestionIndex(0);
     resetTranscripts();
   }, [cancelSpeech, resetTranscripts]);
+
+  if (screen === 'flowBuilder') {
+    return (
+      <FlowBuilder
+        onSave={(stages) => {
+          setCustomFlowStages(stages);
+          setScreen('landing');
+        }}
+        onCancel={() => setScreen('landing')}
+      />
+    );
+  }
 
   if (screen === 'landing') {
     return (
@@ -1272,15 +1294,35 @@ export default function App() {
               </div>
             </div>
 
-            <button
-              onClick={startInterview}
-              disabled={!hasMinimumInfo || loadingState === 'question'}
-              className="mt-5 w-full rounded-xl bg-teal-300 hover:bg-teal-200 disabled:bg-slate-700 disabled:text-slate-400 text-slate-900 font-medium py-3 transition-colors"
-            >
-              {loadingState === 'question' ? 'Preparing...' : 'Start interview'}
-            </button>
+            {customFlowStages && (
+              <div className="mt-5 flex items-center gap-2 text-xs text-teal-300">
+                <span className="inline-block w-2 h-2 rounded-full bg-teal-400" />
+                Custom flow active — {customFlowStages.length} stage{customFlowStages.length !== 1 ? 's' : ''}
+                <button
+                  onClick={() => setCustomFlowStages(null)}
+                  className="ml-1 text-slate-500 hover:text-slate-300 underline"
+                >
+                  clear
+                </button>
+              </div>
+            )}
+            <div className="mt-4 flex gap-3">
+              <button
+                onClick={startInterview}
+                disabled={!hasMinimumInfo || loadingState === 'question'}
+                className="flex-1 rounded-xl bg-teal-300 hover:bg-teal-200 disabled:bg-slate-700 disabled:text-slate-400 text-slate-900 font-medium py-3 transition-colors"
+              >
+                {loadingState === 'question' ? 'Preparing...' : 'Start interview'}
+              </button>
+              <button
+                onClick={() => setScreen('flowBuilder')}
+                className="rounded-xl border border-slate-700 hover:border-teal-400/60 text-slate-300 hover:text-teal-300 font-medium px-4 py-3 transition-colors text-sm"
+              >
+                Design custom flow
+              </button>
+            </div>
             <p className="mt-4 text-xs text-slate-500 text-center leading-relaxed">
-              5 questions. Auto-advances after each answer. Pause anytime to review pointers.
+              {totalQuestions} question{totalQuestions !== 1 ? 's' : ''}. Auto-advances after each answer. Pause anytime to review pointers.
             </p>
             {!speechSupported && (
               <p className="mt-2 text-xs text-slate-500 text-center">
@@ -1425,7 +1467,7 @@ export default function App() {
               <span className="text-slate-100 font-medium">
                 {questionIndex + 1}
               </span>{' '}
-              of {TOTAL_QUESTIONS}
+              of {totalQuestions}
               {isPaused && (
                 <span className="ml-2 text-amber-300 text-xs uppercase tracking-widest">
                   Paused
