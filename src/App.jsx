@@ -148,19 +148,16 @@ function tryParseJSON(text) {
 }
 
 async function callClaude({ system, user, maxTokens }) {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
+  const res = await fetch('/api/anthropic', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-direct-browser-access': 'true',
-      'x-api-key': import.meta.env.VITE_ANTHROPIC_API_KEY
     },
     body: JSON.stringify({
-      model: MODEL,
-      max_tokens: maxTokens,
       system,
-      messages: [{ role: 'user', content: user }],
+      user,
+      maxTokens,
+      model: MODEL,
     }),
   });
   if (!res.ok) {
