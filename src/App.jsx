@@ -3,6 +3,21 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 const MODEL = 'claude-sonnet-4-20250514';
 const TOTAL_QUESTIONS = 5;
 
+const INITIAL_JOB_FORM = {
+  roleTitle: '',
+  level: '',
+  location: '',
+  employmentType: '',
+  remotePolicy: '',
+  salaryRange: '',
+  team: '',
+  responsibilities: '',
+  requirements: '',
+  niceToHave: '',
+  techStack: '',
+  interviewFocus: '',
+};
+
 const QUESTION_SYSTEM = (jobDescription, n) =>
   `You are a senior interviewer at the company hiring for this role:
 ${jobDescription}. Generate ONE interview question appropriate for question number ${n} of 5. Mix across: background/motivation (Q1), behavioural STAR (Q2), role-specific technical (Q3), situational (Q4), challenging curveball (Q5). Return ONLY the question text, no preamble, no numbering, no quotation marks. Keep it realistic and concise.`;
@@ -39,6 +54,37 @@ Rules:
 - encouragement: 2-3 warm sentences framed around how deliberate preparation reduces interview anxiety. Do not be saccharine.
 Return ONLY the JSON. Do not wrap in markdown code fences. Do not add preamble.`;
 };
+
+const EXTRACTION_SYSTEM = `You extract structured job details from a job posting. Return strict JSON with EXACT keys:
+{"roleTitle": string, "level": string, "location": string, "employmentType": string, "remotePolicy": string, "salaryRange": string, "team": string, "responsibilities": string, "requirements": string, "niceToHave": string, "techStack": string, "interviewFocus": string}
+
+Rules:
+- Use empty string if unknown.
+- Keep each value concise; use short sentences or phrases.
+- For responsibilities/requirements/niceToHave/techStack, use semicolon-separated phrases.
+- Do NOT include extra keys or commentary.`;
+
+function buildJobDescription(form, postingText) {
+  const lines = [];
+  if (form.roleTitle) lines.push(`Role: ${form.roleTitle}`);
+  if (form.level) lines.push(`Level: ${form.level}`);
+  if (form.location) lines.push(`Location: ${form.location}`);
+  if (form.employmentType) lines.push(`Employment type: ${form.employmentType}`);
+  if (form.remotePolicy) lines.push(`Remote policy: ${form.remotePolicy}`);
+  if (form.salaryRange) lines.push(`Salary: ${form.salaryRange}`);
+  if (form.team) lines.push(`Team: ${form.team}`);
+  if (form.responsibilities)
+    lines.push(`Responsibilities: ${form.responsibilities}`);
+  if (form.requirements) lines.push(`Requirements: ${form.requirements}`);
+  if (form.niceToHave) lines.push(`Nice to have: ${form.niceToHave}`);
+  if (form.techStack) lines.push(`Tech stack: ${form.techStack}`);
+  if (form.interviewFocus)
+    lines.push(`Interview focus: ${form.interviewFocus}`);
+  if (!lines.length && postingText) {
+    lines.push(`Job posting: ${postingText}`);
+  }
+  return lines.join('\n');
+}
 
 function stripFences(text) {
   if (!text) return '';
@@ -174,7 +220,11 @@ function ErrorPanel({ message, onRetry, onDismiss }) {
 
 export default function App() {
   const [screen, setScreen] = useState('landing');
-  const [jobDescription, setJobDescription] = useState('');
+  const [jobForm, setJobForm] = useState(INITIAL_JOB_FORM);
+  const [jobPostingText, setJobPostingText] = useState('');
+  const [jobPostingUrl, setJobPostingUrl] = useState('');
+  const [isExtracting, setIsExtracting] = useState(false);
+  const [extractionNote, setExtractionNote] = useState('');
 
   const [questionIndex, setQuestionIndex] = useState(0);
   const [currentQuestion, setCurrentQuestion] = useState('');
@@ -199,6 +249,12 @@ export default function App() {
   const recognitionRef = useRef(null);
   const finalTranscriptRef = useRef('');
   const isRecordingRef = useRef(false);
+
+  const jobDescription = buildJobDescription(jobForm, jobPostingText);
+
+  const hasMinimumInfo =
+    !!jobDescription.trim() &&
+    (jobForm.roleTitle.trim() || jobPostingText.trim());
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.speechSynthesis) return;
@@ -453,6 +509,84 @@ export default function App() {
     await fetchQuestion(0);
   }, [jobDescription, fetchQuestion]);
 
+  const applyExtraction = useCallback(
+    (extracted) => {
+      if (!extracted || typeof extracted !== 'object') return;
+      setJobForm((prev) => {
+        const next = { ...prev };
+        Object.keys(INITIAL_JOB_FORM).forEach((key) => {
+          const incoming = (extracted[key] || '').trim();
+          if (!next[key] && incoming) next[key] = incoming;
+        });
+        return next;
+      });
+    },
+    [setJobForm]
+  );
+
+  const extractFromPosting = useCallback(
+    async (text) => {
+      const cleaned = (text || '').trim();
+      if (!cleaned) return;
+      setIsExtracting(true);
+      setExtractionNote('Extracting details…');
+      try {
+        const result = await callClaude({
+          system: EXTRACTION_SYSTEM,
+          user: cleaned.slice(0, 12000),
+          maxTokens: 1024,
+        });
+        const parsed = tryParseJSON(result);
+        if (parsed) {
+          applyExtraction(parsed);
+          setExtractionNote('Filled what we could from the posting.');
+        } else {
+          setExtractionNote('Could not parse the posting. Try pasting text.');
+        }
+      } catch {
+        setExtractionNote('Extraction failed. You can fill fields manually.');
+      } finally {
+        setIsExtracting(false);
+      }
+    },
+    [applyExtraction]
+  );
+
+  const scrapeFromUrl = useCallback(
+    async (url) => {
+      const cleaned = (url || '').trim();
+      if (!cleaned) return;
+      setIsExtracting(true);
+      setExtractionNote('Fetching the posting…');
+      try {
+        const normalized = cleaned.startsWith('http')
+          ? cleaned
+          : `https://${cleaned}`;
+        const proxyUrl = `https://r.jina.ai/http://${normalized.replace(
+          /^https?:\/\//i,
+          ''
+        )}`;
+        const res = await fetch(proxyUrl);
+        if (!res.ok) {
+          throw new Error('Fetch failed');
+        }
+        const text = await res.text();
+        const trimmed = text.trim();
+        if (!trimmed) {
+          setExtractionNote('No readable text found at that URL.');
+          return;
+        }
+        setJobPostingText(trimmed.slice(0, 12000));
+        await extractFromPosting(trimmed);
+      } catch {
+        setExtractionNote('Could not fetch that URL. Try another link.');
+      } finally {
+        setIsExtracting(false);
+      }
+    },
+    [extractFromPosting]
+  );
+
   const onRetryQuestion = useCallback(() => {
     setCurrentFeedback(null);
     setFeedbacks((prev) => {
@@ -517,7 +651,10 @@ export default function App() {
   const restart = useCallback(() => {
     cancelSpeech();
     setScreen('landing');
-    setJobDescription('');
+    setJobForm(INITIAL_JOB_FORM);
+    setJobPostingText('');
+    setJobPostingUrl('');
+    setExtractionNote('');
     setQuestions([]);
     setAnswers([]);
     setFeedbacks([]);
@@ -531,7 +668,7 @@ export default function App() {
   if (screen === 'landing') {
     return (
       <div className="min-h-screen flex items-center justify-center px-5 py-10">
-        <div className="w-full max-w-xl">
+        <div className="w-full max-w-3xl">
           <div className="text-center mb-8">
             <h1 className="text-4xl font-semibold tracking-tight">
               <span className="text-teal-300">Interview</span>{' '}
@@ -543,23 +680,287 @@ export default function App() {
           </div>
 
           <div className="bg-slate-900/60 border border-slate-800/60 rounded-2xl p-6 shadow-xl shadow-black/20">
-            <label
-              htmlFor="jd"
-              className="block text-sm font-medium text-slate-300 mb-2"
-            >
-              Paste the job description
-            </label>
-            <textarea
-              id="jd"
-              value={jobDescription}
-              onChange={(e) => setJobDescription(e.target.value)}
-              placeholder="Paste the full JD here — role, responsibilities, the things they care about."
-              className="w-full min-h-[160px] rounded-xl bg-slate-950/60 border border-slate-800/80 focus:border-teal-400/60 focus:ring-1 focus:ring-teal-400/30 outline-none p-4 text-slate-100 leading-relaxed placeholder:text-slate-500 resize-y"
-            />
+            <div className="grid md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-2">
+                  Job role
+                </label>
+                <input
+                  value={jobForm.roleTitle}
+                  onChange={(e) =>
+                    setJobForm((prev) => ({
+                      ...prev,
+                      roleTitle: e.target.value,
+                    }))
+                  }
+                  placeholder="Senior Product Designer"
+                  className="w-full rounded-xl bg-slate-950/60 border border-slate-800/80 focus:border-teal-400/60 focus:ring-1 focus:ring-teal-400/30 outline-none px-3 py-2 text-slate-100 placeholder:text-slate-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-2">
+                  Level / years
+                </label>
+                <input
+                  value={jobForm.level}
+                  onChange={(e) =>
+                    setJobForm((prev) => ({
+                      ...prev,
+                      level: e.target.value,
+                    }))
+                  }
+                  placeholder="Staff, 6+ years"
+                  className="w-full rounded-xl bg-slate-950/60 border border-slate-800/80 focus:border-teal-400/60 focus:ring-1 focus:ring-teal-400/30 outline-none px-3 py-2 text-slate-100 placeholder:text-slate-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-2">
+                  Location
+                </label>
+                <input
+                  value={jobForm.location}
+                  onChange={(e) =>
+                    setJobForm((prev) => ({
+                      ...prev,
+                      location: e.target.value,
+                    }))
+                  }
+                  placeholder="Austin, TX"
+                  className="w-full rounded-xl bg-slate-950/60 border border-slate-800/80 focus:border-teal-400/60 focus:ring-1 focus:ring-teal-400/30 outline-none px-3 py-2 text-slate-100 placeholder:text-slate-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-2">
+                  Employment type
+                </label>
+                <input
+                  value={jobForm.employmentType}
+                  onChange={(e) =>
+                    setJobForm((prev) => ({
+                      ...prev,
+                      employmentType: e.target.value,
+                    }))
+                  }
+                  placeholder="Full-time, contract"
+                  className="w-full rounded-xl bg-slate-950/60 border border-slate-800/80 focus:border-teal-400/60 focus:ring-1 focus:ring-teal-400/30 outline-none px-3 py-2 text-slate-100 placeholder:text-slate-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-2">
+                  Remote policy
+                </label>
+                <input
+                  value={jobForm.remotePolicy}
+                  onChange={(e) =>
+                    setJobForm((prev) => ({
+                      ...prev,
+                      remotePolicy: e.target.value,
+                    }))
+                  }
+                  placeholder="Hybrid 3 days in office"
+                  className="w-full rounded-xl bg-slate-950/60 border border-slate-800/80 focus:border-teal-400/60 focus:ring-1 focus:ring-teal-400/30 outline-none px-3 py-2 text-slate-100 placeholder:text-slate-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-2">
+                  Salary range
+                </label>
+                <input
+                  value={jobForm.salaryRange}
+                  onChange={(e) =>
+                    setJobForm((prev) => ({
+                      ...prev,
+                      salaryRange: e.target.value,
+                    }))
+                  }
+                  placeholder="$140k-$175k"
+                  className="w-full rounded-xl bg-slate-950/60 border border-slate-800/80 focus:border-teal-400/60 focus:ring-1 focus:ring-teal-400/30 outline-none px-3 py-2 text-slate-100 placeholder:text-slate-500"
+                />
+              </div>
+            </div>
+
+            <div className="mt-4 grid md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-2">
+                  Team / domain
+                </label>
+                <textarea
+                  value={jobForm.team}
+                  onChange={(e) =>
+                    setJobForm((prev) => ({
+                      ...prev,
+                      team: e.target.value,
+                    }))
+                  }
+                  placeholder="Payments platform, growth squad"
+                  className="w-full min-h-[90px] rounded-xl bg-slate-950/60 border border-slate-800/80 focus:border-teal-400/60 focus:ring-1 focus:ring-teal-400/30 outline-none p-3 text-slate-100 leading-relaxed placeholder:text-slate-500 resize-y"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-2">
+                  Interview focus
+                </label>
+                <textarea
+                  value={jobForm.interviewFocus}
+                  onChange={(e) =>
+                    setJobForm((prev) => ({
+                      ...prev,
+                      interviewFocus: e.target.value,
+                    }))
+                  }
+                  placeholder="Customer empathy, roadmap ownership, cross-functional influence"
+                  className="w-full min-h-[90px] rounded-xl bg-slate-950/60 border border-slate-800/80 focus:border-teal-400/60 focus:ring-1 focus:ring-teal-400/30 outline-none p-3 text-slate-100 leading-relaxed placeholder:text-slate-500 resize-y"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-2">
+                  Responsibilities
+                </label>
+                <textarea
+                  value={jobForm.responsibilities}
+                  onChange={(e) =>
+                    setJobForm((prev) => ({
+                      ...prev,
+                      responsibilities: e.target.value,
+                    }))
+                  }
+                  placeholder="Own design systems; Lead research; Partner with PM"
+                  className="w-full min-h-[110px] rounded-xl bg-slate-950/60 border border-slate-800/80 focus:border-teal-400/60 focus:ring-1 focus:ring-teal-400/30 outline-none p-3 text-slate-100 leading-relaxed placeholder:text-slate-500 resize-y"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-2">
+                  Requirements
+                </label>
+                <textarea
+                  value={jobForm.requirements}
+                  onChange={(e) =>
+                    setJobForm((prev) => ({
+                      ...prev,
+                      requirements: e.target.value,
+                    }))
+                  }
+                  placeholder="7+ years UX; shipped B2B SaaS; strong facilitation"
+                  className="w-full min-h-[110px] rounded-xl bg-slate-950/60 border border-slate-800/80 focus:border-teal-400/60 focus:ring-1 focus:ring-teal-400/30 outline-none p-3 text-slate-100 leading-relaxed placeholder:text-slate-500 resize-y"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-2">
+                  Nice to have
+                </label>
+                <textarea
+                  value={jobForm.niceToHave}
+                  onChange={(e) =>
+                    setJobForm((prev) => ({
+                      ...prev,
+                      niceToHave: e.target.value,
+                    }))
+                  }
+                  placeholder="Fintech experience; design ops"
+                  className="w-full min-h-[90px] rounded-xl bg-slate-950/60 border border-slate-800/80 focus:border-teal-400/60 focus:ring-1 focus:ring-teal-400/30 outline-none p-3 text-slate-100 leading-relaxed placeholder:text-slate-500 resize-y"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-2">
+                  Tech stack
+                </label>
+                <textarea
+                  value={jobForm.techStack}
+                  onChange={(e) =>
+                    setJobForm((prev) => ({
+                      ...prev,
+                      techStack: e.target.value,
+                    }))
+                  }
+                  placeholder="Figma; React; design tokens"
+                  className="w-full min-h-[90px] rounded-xl bg-slate-950/60 border border-slate-800/80 focus:border-teal-400/60 focus:ring-1 focus:ring-teal-400/30 outline-none p-3 text-slate-100 leading-relaxed placeholder:text-slate-500 resize-y"
+                />
+              </div>
+            </div>
+
+            <div className="mt-6 border-t border-slate-800/60 pt-5">
+              <div className="flex items-center justify-between flex-wrap gap-3">
+                <div>
+                  <p className="text-sm font-medium text-slate-200">
+                    Add a job posting
+                  </p>
+                  <p className="text-xs text-slate-500">
+                    Paste a link, upload a file, or paste the full posting.
+                  </p>
+                </div>
+                <label className="inline-flex items-center gap-2 rounded-xl border border-slate-800/80 px-3 py-2 text-sm text-slate-300 hover:text-slate-100 hover:border-slate-700 cursor-pointer">
+                  <input
+                    type="file"
+                    accept=".txt,.md,.rtf"
+                    className="hidden"
+                    onChange={async (e) => {
+                      const file = e.target.files?.[0];
+                      if (!file) return;
+                      if (!/\.(txt|md|rtf)$/i.test(file.name)) {
+                        setExtractionNote('Please upload a .txt, .md, or .rtf file.');
+                        return;
+                      }
+                      const text = await file.text();
+                      setJobPostingText(text.trim());
+                      extractFromPosting(text);
+                    }}
+                  />
+                  <span>Choose file</span>
+                </label>
+              </div>
+              <div className="mt-4">
+                <label className="block text-xs font-medium text-slate-400 mb-2">
+                  Paste a job link
+                </label>
+                <div className="flex flex-col md:flex-row gap-3">
+                  <input
+                    value={jobPostingUrl}
+                    onChange={(e) => setJobPostingUrl(e.target.value)}
+                    placeholder="https://company.com/careers/role"
+                    className="flex-1 rounded-xl bg-slate-950/60 border border-slate-800/80 focus:border-teal-400/60 focus:ring-1 focus:ring-teal-400/30 outline-none px-3 py-2 text-slate-100 placeholder:text-slate-500"
+                  />
+                  <button
+                    onClick={() => scrapeFromUrl(jobPostingUrl)}
+                    disabled={!jobPostingUrl.trim() || isExtracting}
+                    className="rounded-xl bg-slate-100/10 hover:bg-slate-100/20 disabled:bg-slate-800/60 disabled:text-slate-500 text-slate-100 font-medium px-4 py-2"
+                  >
+                    {isExtracting ? 'Fetching…' : 'Fetch from link'}
+                  </button>
+                </div>
+                <p className="mt-2 text-xs text-slate-600">
+                  Note: some sites block scraping; try a different link or paste the text.
+                </p>
+              </div>
+              <div className="mt-3">
+                <label className="block text-xs font-medium text-slate-400 mb-2">
+                  Or paste a full job posting
+                </label>
+                <textarea
+                  value={jobPostingText}
+                  onChange={(e) => setJobPostingText(e.target.value)}
+                  placeholder="Paste the full posting and click Extract."
+                  className="w-full min-h-[120px] rounded-xl bg-slate-950/60 border border-slate-800/80 focus:border-teal-400/60 focus:ring-1 focus:ring-teal-400/30 outline-none p-3 text-slate-100 leading-relaxed placeholder:text-slate-500 resize-y"
+                />
+                <div className="mt-3 flex items-center gap-3">
+                  <button
+                    onClick={() => extractFromPosting(jobPostingText)}
+                    disabled={!jobPostingText.trim() || isExtracting}
+                    className="rounded-xl bg-slate-100/10 hover:bg-slate-100/20 disabled:bg-slate-800/60 disabled:text-slate-500 text-slate-100 font-medium px-4 py-2"
+                  >
+                    {isExtracting ? 'Extracting…' : 'Extract details'}
+                  </button>
+                  {extractionNote && (
+                    <span className="text-xs text-slate-500">
+                      {extractionNote}
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
 
             <button
               onClick={startInterview}
-              disabled={!jobDescription.trim() || loadingState === 'question'}
+              disabled={!hasMinimumInfo || loadingState === 'question'}
               className="mt-5 w-full rounded-xl bg-teal-300 hover:bg-teal-200 disabled:bg-slate-700 disabled:text-slate-400 text-slate-900 font-medium py-3 transition-colors"
             >
               {loadingState === 'question' ? 'Preparing…' : 'Start interview'}
