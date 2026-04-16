@@ -74,6 +74,7 @@ async function callClaude({ system, user, maxTokens }) {
       'content-type': 'application/json',
       'anthropic-version': '2023-06-01',
       'anthropic-dangerous-direct-browser-access': 'true',
+      'x-api-key': import.meta.env.VITE_ANTHROPIC_API_KEY
     },
     body: JSON.stringify({
       model: MODEL,
