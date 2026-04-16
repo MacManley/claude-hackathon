@@ -174,6 +174,102 @@ function tryParseJSON(text) {
   }
 }
 
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function buildReportHtml({ summary, questions, answers, feedbacks, jobForm }) {
+  const safeSummary = summary && !summary.fallback ? summary : null;
+  const rows = questions
+    .map((q, i) => ({
+      question: q,
+      answer: answers[i],
+      feedback: feedbacks[i],
+      index: i,
+    }))
+    .filter((item) => item.question && item.answer);
+
+  const jobLines = [
+    jobForm.roleTitle && `Role: ${jobForm.roleTitle}`,
+    jobForm.level && `Level: ${jobForm.level}`,
+    jobForm.location && `Location: ${jobForm.location}`,
+    jobForm.employmentType && `Employment type: ${jobForm.employmentType}`,
+    jobForm.remotePolicy && `Remote policy: ${jobForm.remotePolicy}`,
+    jobForm.salaryRange && `Salary: ${jobForm.salaryRange}`,
+    jobForm.team && `Team: ${jobForm.team}`,
+    jobForm.interviewFocus && `Interview focus: ${jobForm.interviewFocus}`,
+  ].filter(Boolean);
+
+  const strengths = safeSummary?.strengths || [];
+  const toWorkOn = safeSummary?.toWorkOn || [];
+
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Interview Report</title>
+    <style>
+      body { font-family: Arial, sans-serif; color: #111827; margin: 40px; }
+      h1 { font-size: 24px; margin-bottom: 4px; }
+      h2 { font-size: 18px; margin-top: 28px; }
+      h3 { font-size: 14px; margin-top: 18px; }
+      p { font-size: 13px; line-height: 1.5; }
+      ul { padding-left: 20px; }
+      .meta { color: #6b7280; font-size: 12px; }
+      .card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; margin-top: 12px; }
+      .score { font-size: 20px; font-weight: 700; }
+      .qa { margin-top: 10px; padding-top: 10px; border-top: 1px solid #e5e7eb; }
+      .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #6b7280; }
+    </style>
+  </head>
+  <body>
+    <h1>Interview Report</h1>
+    <p class="meta">Generated ${escapeHtml(new Date().toLocaleString())}</p>
+    ${jobLines.length ? `<div class="card"><h3>Role details</h3><ul>${jobLines
+      .map((line) => `<li>${escapeHtml(line)}</li>`)
+      .join('')}</ul></div>` : ''}
+
+    <div class="card">
+      <h2>Overall summary</h2>
+      ${safeSummary ? `<p class="score">Overall score: ${escapeHtml(safeSummary.overallScore)} / 10</p>` : '<p>No summary available.</p>'}
+      ${strengths.length ? `<h3>Strengths</h3><ul>${strengths
+        .map((item) => `<li>${escapeHtml(item)}</li>`)
+        .join('')}</ul>` : ''}
+      ${toWorkOn.length ? `<h3>Recommendations</h3><ul>${toWorkOn
+        .map((item) => `<li>${escapeHtml(item)}</li>`)
+        .join('')}</ul>` : ''}
+      ${safeSummary?.encouragement ? `<p>${escapeHtml(safeSummary.encouragement)}</p>` : ''}
+    </div>
+
+    <div class="card">
+      <h2>Question breakdown</h2>
+      ${rows
+        .map((row) => {
+          const score = row.feedback?.score ?? 'n/a';
+          const pointers = row.feedback?.pointers || [];
+          return `
+            <div class="qa">
+              <div class="label">Question ${row.index + 1}</div>
+              <p><strong>Q:</strong> ${escapeHtml(row.question)}</p>
+              <p><strong>A:</strong> ${escapeHtml(row.answer)}</p>
+              <p><strong>Score:</strong> ${escapeHtml(score)}</p>
+              ${pointers.length ? `<h3>Pointers</h3><ul>${pointers
+                .map((p) => `<li><strong>${escapeHtml(p.title)}:</strong> ${escapeHtml(p.detail)}</li>`)
+                .join('')}</ul>` : ''}
+            </div>
+          `;
+        })
+        .join('')}
+    </div>
+  </body>
+</html>`;
+}
+
 async function callClaude({ system, user, maxTokens }) {
   const res = await fetch('/api/anthropic', {
     method: 'POST',
@@ -965,6 +1061,25 @@ export default function App() {
     resetTranscripts();
   }, [cancelSpeech, resetTranscripts]);
 
+  const downloadReport = useCallback(() => {
+    const html = buildReportHtml({
+      summary,
+      questions,
+      answers,
+      feedbacks,
+      jobForm,
+    });
+    const reportWindow = window.open('', '_blank', 'width=900,height=700');
+    if (!reportWindow) return;
+    reportWindow.document.open();
+    reportWindow.document.write(html);
+    reportWindow.document.close();
+    reportWindow.focus();
+    reportWindow.onload = () => {
+      reportWindow.print();
+    };
+  }, [answers, feedbacks, jobForm, questions, summary]);
+
   if (screen === 'flowBuilder') {
     return (
       <FlowBuilder
@@ -1408,7 +1523,13 @@ export default function App() {
               </p>
             </div>
           )}
-          <div className="mt-6 flex justify-center">
+          <div className="mt-6 flex flex-wrap justify-center gap-3">
+            <button
+              onClick={downloadReport}
+              className="rounded-xl border border-slate-700/80 text-slate-200 hover:text-slate-100 hover:border-slate-500 px-6 py-3"
+            >
+              Download PDF report
+            </button>
             <button
               onClick={restart}
               className="rounded-xl bg-teal-300 hover:bg-teal-200 text-slate-900 font-medium px-6 py-3"
