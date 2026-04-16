@@ -2,6 +2,30 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 const MODEL = 'claude-sonnet-4-20250514';
 const TOTAL_QUESTIONS = 5;
+const SILENCE_TIMEOUT_MS = 5000;
+const AUTO_ADVANCE_DELAY_MS = 900;
+
+const REASSURANCE_FALLBACKS = [
+  'Thanks, got it.',
+  'Appreciate the detail.',
+  "Got it. Let's keep moving.",
+  'Thanks for that - understood.',
+];
+
+const FALLBACK_POINTERS = [
+  {
+    title: 'Lead with context',
+    detail: 'Open with the situation and your role so the listener can follow.',
+  },
+  {
+    title: 'Show your impact',
+    detail: 'Call out results with numbers, scope, or clear outcomes.',
+  },
+  {
+    title: 'Tighten the close',
+    detail: 'End with a takeaway that ties back to the question.',
+  },
+];
 
 const INITIAL_JOB_FORM = {
   roleTitle: '',
@@ -24,8 +48,13 @@ ${jobDescription}. Generate ONE interview question appropriate for question numb
 
 const FEEDBACK_SYSTEM = (jobDescription, question, answer) =>
   `You are a direct, experienced interview coach. The job: ${jobDescription}. The question asked: ${question}. The candidate's answer: ${answer}. Respond in strict JSON with this exact shape:
-{"worked": string, "didnt": string, "sharper": string, "score": number}
-Be honest — don't flatter weak answers. 'worked' = 1-2 specific strengths or 'nothing notable'. 'didnt' = honest problems (filler words, no STAR structure, vague, didn't answer the question, no quantified impact). 'sharper' = 1-2 sentences showing how a strong candidate would have opened. 'score' = integer 0-10. Return ONLY the JSON object. Do not wrap in markdown code fences. Do not add any preamble or explanation.`;
+{"reaffirmation": string, "pointers": [{"title": string, "detail": string}, {"title": string, "detail": string}, {"title": string, "detail": string}], "score": number}
+
+Rules:
+- reaffirmation: one short, warm sentence that acknowledges the answer without flattery.
+- pointers: exactly three items; title is 3-6 words, detail is 1-2 sentences specific to the answer.
+- score: integer 0-10.
+Return ONLY the JSON object. Do not wrap in markdown code fences. Do not add any preamble or explanation.`;
 
 const SUMMARY_SYSTEM = (jobDescription, pairs) => {
   const transcript = pairs
@@ -93,6 +122,11 @@ function stripFences(text) {
     .replace(/^```(?:json)?\s*/i, '')
     .replace(/\s*```$/i, '')
     .trim();
+}
+
+function pickReaffirmation() {
+  const index = Math.floor(Math.random() * REASSURANCE_FALLBACKS.length);
+  return REASSURANCE_FALLBACKS[index] || 'Thanks, got it.';
 }
 
 function tryParseJSON(text) {
@@ -165,23 +199,6 @@ function pickVoice(voices) {
   );
 }
 
-const MicIcon = ({ on }) => (
-  <svg
-    viewBox="0 0 24 24"
-    className="w-7 h-7"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="1.8"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-  >
-    <rect x="9" y="3" width="6" height="12" rx="3" />
-    <path d="M5 11a7 7 0 0 0 14 0" />
-    <line x1="12" y1="18" x2="12" y2="22" />
-    {on && <circle cx="19" cy="5" r="2" fill="currentColor" stroke="none" />}
-  </svg>
-);
-
 function BreathingDot() {
   return (
     <span
@@ -236,25 +253,55 @@ export default function App() {
   const [currentFeedback, setCurrentFeedback] = useState(null);
   const [interimTranscript, setInterimTranscript] = useState('');
   const [isRecording, setIsRecording] = useState(false);
+  const [speechTick, setSpeechTick] = useState(0);
   const [inputMode, setInputMode] = useState('voice');
   const [emptyWarning, setEmptyWarning] = useState(false);
+
+  const [chatLog, setChatLog] = useState([]);
+  const [isPaused, setIsPaused] = useState(false);
+  const [autoAdvanceReady, setAutoAdvanceReady] = useState(false);
+  const [reviewIndex, setReviewIndex] = useState(0);
+  const [activePointer, setActivePointer] = useState(null);
 
   const [loadingState, setLoadingState] = useState('idle');
   const [errorState, setErrorState] = useState(null);
 
   const [summary, setSummary] = useState(null);
 
+  const [countdown, setCountdown] = useState(3);
+  const [countdownActive, setCountdownActive] = useState(false);
+
   const [voices, setVoices] = useState([]);
   const [speechSupported, setSpeechSupported] = useState(true);
   const recognitionRef = useRef(null);
   const finalTranscriptRef = useRef('');
   const isRecordingRef = useRef(false);
+  const silenceTimerRef = useRef(null);
+  const autoAdvanceRef = useRef(null);
+  const hasSpeechRef = useRef(false);
+  const isPausedRef = useRef(false);
+  const inputModeRef = useRef('voice');
+  const chatEndRef = useRef(null);
+  const onNextQuestionRef = useRef(null);
 
   const jobDescription = buildJobDescription(jobForm, jobPostingText);
 
   const hasMinimumInfo =
     !!jobDescription.trim() &&
     (jobForm.roleTitle.trim() || jobPostingText.trim());
+
+  useEffect(() => {
+    isPausedRef.current = isPaused;
+  }, [isPaused]);
+
+  useEffect(() => {
+    inputModeRef.current = inputMode;
+  }, [inputMode]);
+
+  useEffect(() => {
+    if (screen !== 'interview') return;
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }, [chatLog, currentAnswer, currentFeedback, currentQuestion, loadingState, screen]);
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.speechSynthesis) return;
@@ -291,11 +338,20 @@ export default function App() {
         else interim += chunk;
       }
       if (appended) {
-        const next = (finalTranscriptRef.current + ' ' + appended)
+        const nextFinal = (finalTranscriptRef.current + ' ' + appended)
           .replace(/\s+/g, ' ')
           .trim();
-        finalTranscriptRef.current = next;
-        setCurrentAnswer(next);
+        finalTranscriptRef.current = nextFinal;
+      }
+      const combined = `${finalTranscriptRef.current} ${interim}`
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (combined) {
+        setCurrentAnswer(combined);
+        if (!isPausedRef.current && inputModeRef.current === 'voice') {
+          setSpeechTick(Date.now());
+          hasSpeechRef.current = true;
+        }
       }
       setInterimTranscript(interim.trim());
     };
@@ -305,6 +361,10 @@ export default function App() {
       if (isRecordingRef.current) {
         isRecordingRef.current = false;
         setIsRecording(false);
+      }
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = null;
       }
     };
     recognitionRef.current = recognition;
@@ -319,9 +379,11 @@ export default function App() {
   }, []);
 
   const speak = useCallback(
-    (text) => {
-      if (typeof window === 'undefined' || !window.speechSynthesis || !text)
+    (text, onEnd) => {
+      if (typeof window === 'undefined' || !window.speechSynthesis || !text) {
+        if (onEnd) onEnd();
         return;
+      }
       try {
         window.speechSynthesis.cancel();
         const u = new SpeechSynthesisUtterance(text);
@@ -329,8 +391,14 @@ export default function App() {
         u.pitch = 1.0;
         const v = pickVoice(voices);
         if (v) u.voice = v;
+        if (onEnd) {
+          u.onend = () => onEnd();
+          u.onerror = () => onEnd();
+        }
         window.speechSynthesis.speak(u);
-      } catch {}
+      } catch {
+        if (onEnd) onEnd();
+      }
     },
     [voices]
   );
@@ -343,11 +411,13 @@ export default function App() {
 
   const startRecording = useCallback(() => {
     const rec = recognitionRef.current;
-    if (!rec) return;
+    if (!rec || isPausedRef.current) return;
     cancelSpeech();
     try {
       finalTranscriptRef.current = currentAnswer || '';
       setInterimTranscript('');
+      hasSpeechRef.current = false;
+      setSpeechTick(0);
       rec.start();
       isRecordingRef.current = true;
       setIsRecording(true);
@@ -362,24 +432,37 @@ export default function App() {
     } catch {}
     isRecordingRef.current = false;
     setIsRecording(false);
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
   }, []);
-
-  const toggleRecording = useCallback(() => {
-    if (isRecording) stopRecording();
-    else startRecording();
-  }, [isRecording, startRecording, stopRecording]);
 
   const resetTranscripts = useCallback(() => {
     finalTranscriptRef.current = '';
     setInterimTranscript('');
     setCurrentAnswer('');
+    setSpeechTick(0);
+    hasSpeechRef.current = false;
     setEmptyWarning(false);
   }, []);
+
+  const startListening = useCallback(() => {
+    if (!speechSupported || inputModeRef.current !== 'voice') return;
+    if (isPausedRef.current) return;
+    if (isRecordingRef.current) return;
+    startRecording();
+  }, [speechSupported, startRecording]);
 
   const fetchQuestion = useCallback(
     async (n) => {
       setLoadingState('question');
       setErrorState(null);
+      if (autoAdvanceRef.current) {
+        clearTimeout(autoAdvanceRef.current);
+        autoAdvanceRef.current = null;
+      }
+      setAutoAdvanceReady(false);
       try {
         const text = await callClaude({
           system: QUESTION_SYSTEM(jobDescription, n + 1),
@@ -395,9 +478,19 @@ export default function App() {
         });
         setQuestionIndex(n);
         setCurrentFeedback(null);
+        setActivePointer(null);
         resetTranscripts();
         setLoadingState('idle');
-        setTimeout(() => speak(cleaned), 200);
+        setChatLog((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}-${n}`,
+            role: 'interviewer',
+            text: cleaned,
+            questionIndex: n,
+          },
+        ]);
+        setTimeout(() => speak(cleaned, startListening), 200);
       } catch (err) {
         setLoadingState('idle');
         setErrorState({
@@ -407,63 +500,150 @@ export default function App() {
         });
       }
     },
-    [jobDescription, resetTranscripts, speak]
+    [jobDescription, resetTranscripts, speak, startListening]
   );
 
-  const submitAnswer = useCallback(async () => {
-    const answer = (currentAnswer || '').trim();
-    if (!answer) {
-      setEmptyWarning(true);
+  const scheduleAutoAdvance = useCallback(() => {
+    if (autoAdvanceRef.current) {
+      clearTimeout(autoAdvanceRef.current);
+      autoAdvanceRef.current = null;
+    }
+    if (isPausedRef.current) {
+      setAutoAdvanceReady(true);
       return;
     }
-    setEmptyWarning(false);
-    if (isRecordingRef.current) {
+    setAutoAdvanceReady(false);
+    autoAdvanceRef.current = setTimeout(() => {
+      onNextQuestionRef.current?.();
+    }, AUTO_ADVANCE_DELAY_MS);
+  }, []);
+
+  const submitAnswer = useCallback(
+    async (answerOverride, options = {}) => {
+      const answer = (answerOverride ?? (currentAnswer || '')).trim();
+      const { skipAppend } = options;
+      if (!answer) {
+        setEmptyWarning(true);
+        return;
+      }
+      setEmptyWarning(false);
+      if (isRecordingRef.current) {
+        try {
+          recognitionRef.current?.stop();
+        } catch {}
+        isRecordingRef.current = false;
+        setIsRecording(false);
+      }
+      cancelSpeech();
+      setLoadingState('feedback');
+      setErrorState(null);
+      if (!skipAppend) {
+        setChatLog((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}-a-${questionIndex}`,
+            role: 'candidate',
+            text: answer,
+            questionIndex,
+          },
+        ]);
+        resetTranscripts();
+      }
       try {
-        recognitionRef.current?.stop();
-      } catch {}
-      isRecordingRef.current = false;
-      setIsRecording(false);
+        const text = await callClaude({
+          system: FEEDBACK_SYSTEM(jobDescription, currentQuestion, answer),
+          user: 'Return the JSON feedback now.',
+          maxTokens: 1024,
+        });
+        const parsed = tryParseJSON(text);
+        const reaffirmation =
+          parsed && typeof parsed.reaffirmation === 'string'
+            ? parsed.reaffirmation.trim()
+            : pickReaffirmation();
+        const pointers = Array.isArray(parsed?.pointers)
+          ? parsed.pointers
+              .filter((p) => p && p.title && p.detail)
+              .map((p) => ({
+                title: String(p.title).trim(),
+                detail: String(p.detail).trim(),
+              }))
+          : [];
+        const score =
+          parsed && typeof parsed.score === 'number' ? parsed.score : 5;
+        const feedbackEntry = {
+          reaffirmation: reaffirmation || pickReaffirmation(),
+          pointers: pointers.length ? pointers.slice(0, 3) : FALLBACK_POINTERS,
+          score,
+        };
+        setCurrentFeedback(feedbackEntry);
+        setAnswers((prev) => {
+          const copy = prev.slice();
+          copy[questionIndex] = answer;
+          return copy;
+        });
+        setFeedbacks((prev) => {
+          const copy = prev.slice();
+          copy[questionIndex] = feedbackEntry;
+          return copy;
+        });
+        setReviewIndex(questionIndex);
+        setActivePointer(null);
+        setChatLog((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}-c-${questionIndex}`,
+            role: 'coach',
+            text: feedbackEntry.reaffirmation,
+            questionIndex,
+          },
+        ]);
+        setLoadingState('idle');
+        scheduleAutoAdvance();
+      } catch (err) {
+        setLoadingState('idle');
+        setErrorState({
+          message:
+            'Something went wrong on our end. Try that answer again?',
+          retry: () => submitAnswer(answer, { skipAppend: true }),
+        });
+      }
+    },
+    [
+      cancelSpeech,
+      currentAnswer,
+      currentQuestion,
+      jobDescription,
+      questionIndex,
+      resetTranscripts,
+      scheduleAutoAdvance,
+    ]
+  );
+
+  const finalizeAnswer = useCallback(() => {
+    if (loadingState !== 'idle' || currentFeedback) return;
+    const answer = (currentAnswer || '').trim();
+    if (!answer) return;
+    stopRecording();
+    submitAnswer(answer);
+  }, [currentAnswer, currentFeedback, loadingState, stopRecording, submitAnswer]);
+
+  useEffect(() => {
+    if (!isRecording || !speechTick || isPaused) return;
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
     }
-    cancelSpeech();
-    setLoadingState('feedback');
-    setErrorState(null);
-    try {
-      const text = await callClaude({
-        system: FEEDBACK_SYSTEM(jobDescription, currentQuestion, answer),
-        user: 'Return the JSON feedback now.',
-        maxTokens: 1024,
-      });
-      const parsed = tryParseJSON(text);
-      const feedbackEntry =
-        parsed &&
-        typeof parsed === 'object' &&
-        'worked' in parsed &&
-        'didnt' in parsed &&
-        'sharper' in parsed &&
-        'score' in parsed
-          ? parsed
-          : { raw: text };
-      setCurrentFeedback(feedbackEntry);
-      setAnswers((prev) => {
-        const copy = prev.slice();
-        copy[questionIndex] = answer;
-        return copy;
-      });
-      setFeedbacks((prev) => {
-        const copy = prev.slice();
-        copy[questionIndex] = feedbackEntry;
-        return copy;
-      });
-      setLoadingState('idle');
-    } catch (err) {
-      setLoadingState('idle');
-      setErrorState({
-        message:
-          'Something went wrong on our end. Try that answer again?',
-        retry: () => submitAnswer(),
-      });
-    }
-  }, [cancelSpeech, currentAnswer, currentQuestion, jobDescription, questionIndex]);
+    silenceTimerRef.current = setTimeout(() => {
+      if (isPausedRef.current) return;
+      if (!hasSpeechRef.current) return;
+      finalizeAnswer();
+    }, SILENCE_TIMEOUT_MS);
+    return () => {
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = null;
+      }
+    };
+  }, [finalizeAnswer, isPaused, isRecording, speechTick]);
 
   const fetchSummary = useCallback(
     async (pairs) => {
@@ -505,9 +685,31 @@ export default function App() {
     setAnswers([]);
     setFeedbacks([]);
     setSummary(null);
-    setScreen('interview');
-    await fetchQuestion(0);
-  }, [jobDescription, fetchQuestion]);
+    setChatLog([]);
+    setCurrentQuestion('');
+    setCurrentFeedback(null);
+    setIsPaused(false);
+    setAutoAdvanceReady(false);
+    setReviewIndex(0);
+    setActivePointer(null);
+    setCountdown(3);
+    setCountdownActive(true);
+    setScreen('countdown');
+  }, [jobDescription]);
+
+  useEffect(() => {
+    if (screen !== 'countdown' || !countdownActive) return;
+    if (countdown <= 0) {
+      setCountdownActive(false);
+      setScreen('interview');
+      fetchQuestion(0);
+      return;
+    }
+    const timer = setTimeout(() => {
+      setCountdown((prev) => prev - 1);
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [countdown, countdownActive, fetchQuestion, screen]);
 
   const applyExtraction = useCallback(
     (extracted) => {
@@ -529,7 +731,7 @@ export default function App() {
       const cleaned = (text || '').trim();
       if (!cleaned) return;
       setIsExtracting(true);
-      setExtractionNote('Extracting details…');
+      setExtractionNote('Extracting details...');
       try {
         const result = await callClaude({
           system: EXTRACTION_SYSTEM,
@@ -557,7 +759,7 @@ export default function App() {
       const cleaned = (url || '').trim();
       if (!cleaned) return;
       setIsExtracting(true);
-      setExtractionNote('Fetching the posting…');
+      setExtractionNote('Fetching the posting...');
       try {
         const normalized = cleaned.startsWith('http')
           ? cleaned
@@ -587,24 +789,8 @@ export default function App() {
     [extractFromPosting]
   );
 
-  const onRetryQuestion = useCallback(() => {
-    setCurrentFeedback(null);
-    setFeedbacks((prev) => {
-      const copy = prev.slice();
-      copy[questionIndex] = undefined;
-      return copy;
-    });
-    setAnswers((prev) => {
-      const copy = prev.slice();
-      copy[questionIndex] = undefined;
-      return copy;
-    });
-    resetTranscripts();
-    cancelSpeech();
-    setTimeout(() => speak(currentQuestion), 150);
-  }, [cancelSpeech, currentQuestion, questionIndex, resetTranscripts, speak]);
-
   const onNextQuestion = useCallback(async () => {
+    setAutoAdvanceReady(false);
     const nextIndex = questionIndex + 1;
     if (nextIndex >= TOTAL_QUESTIONS) {
       const pairs = questions
@@ -620,8 +806,71 @@ export default function App() {
     }
   }, [answers, fetchQuestion, fetchSummary, feedbacks, questionIndex, questions]);
 
+  useEffect(() => {
+    onNextQuestionRef.current = onNextQuestion;
+  }, [onNextQuestion]);
+
+  const pauseSession = useCallback(() => {
+    cancelSpeech();
+    stopRecording();
+    if (autoAdvanceRef.current) {
+      clearTimeout(autoAdvanceRef.current);
+      autoAdvanceRef.current = null;
+      setAutoAdvanceReady(true);
+    }
+    setIsPaused(true);
+  }, [cancelSpeech, stopRecording]);
+
+  const resumeSession = useCallback(() => {
+    setIsPaused(false);
+  }, []);
+
+  const togglePause = useCallback(() => {
+    if (isPaused) resumeSession();
+    else pauseSession();
+  }, [isPaused, pauseSession, resumeSession]);
+
+  useEffect(() => {
+    if (screen !== 'interview' || isPaused) return;
+    if (autoAdvanceReady) {
+      setAutoAdvanceReady(false);
+      onNextQuestion();
+      return;
+    }
+    if (
+      speechSupported &&
+      inputMode === 'voice' &&
+      currentQuestion &&
+      !currentFeedback &&
+      loadingState === 'idle' &&
+      !isRecording
+    ) {
+      startListening();
+    }
+  }, [
+    autoAdvanceReady,
+    currentFeedback,
+    currentQuestion,
+    inputMode,
+    isPaused,
+    isRecording,
+    loadingState,
+    onNextQuestion,
+    screen,
+    speechSupported,
+    startListening,
+  ]);
+
   const endSession = useCallback(async () => {
     cancelSpeech();
+    if (autoAdvanceRef.current) {
+      clearTimeout(autoAdvanceRef.current);
+      autoAdvanceRef.current = null;
+    }
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
     if (isRecordingRef.current) {
       try {
         recognitionRef.current?.stop();
@@ -655,11 +904,18 @@ export default function App() {
     setJobPostingText('');
     setJobPostingUrl('');
     setExtractionNote('');
+    setCountdown(3);
+    setCountdownActive(false);
     setQuestions([]);
     setAnswers([]);
     setFeedbacks([]);
     setCurrentQuestion('');
     setCurrentFeedback(null);
+    setChatLog([]);
+    setIsPaused(false);
+    setAutoAdvanceReady(false);
+    setReviewIndex(0);
+    setActivePointer(null);
     setSummary(null);
     setQuestionIndex(0);
     resetTranscripts();
@@ -924,7 +1180,7 @@ export default function App() {
                     disabled={!jobPostingUrl.trim() || isExtracting}
                     className="rounded-xl bg-slate-100/10 hover:bg-slate-100/20 disabled:bg-slate-800/60 disabled:text-slate-500 text-slate-100 font-medium px-4 py-2"
                   >
-                    {isExtracting ? 'Fetching…' : 'Fetch from link'}
+                    {isExtracting ? 'Fetching...' : 'Fetch from link'}
                   </button>
                 </div>
                 <p className="mt-2 text-xs text-slate-600">
@@ -947,7 +1203,7 @@ export default function App() {
                     disabled={!jobPostingText.trim() || isExtracting}
                     className="rounded-xl bg-slate-100/10 hover:bg-slate-100/20 disabled:bg-slate-800/60 disabled:text-slate-500 text-slate-100 font-medium px-4 py-2"
                   >
-                    {isExtracting ? 'Extracting…' : 'Extract details'}
+                    {isExtracting ? 'Extracting...' : 'Extract details'}
                   </button>
                   {extractionNote && (
                     <span className="text-xs text-slate-500">
@@ -963,10 +1219,10 @@ export default function App() {
               disabled={!hasMinimumInfo || loadingState === 'question'}
               className="mt-5 w-full rounded-xl bg-teal-300 hover:bg-teal-200 disabled:bg-slate-700 disabled:text-slate-400 text-slate-900 font-medium py-3 transition-colors"
             >
-              {loadingState === 'question' ? 'Preparing…' : 'Start interview'}
+              {loadingState === 'question' ? 'Preparing...' : 'Start interview'}
             </button>
             <p className="mt-4 text-xs text-slate-500 text-center leading-relaxed">
-              5 questions. Honest feedback after each. You can redo any answer.
+              5 questions. Auto-advances after each answer. Pause anytime to review pointers.
             </p>
             {!speechSupported && (
               <p className="mt-2 text-xs text-slate-500 text-center">
@@ -1065,15 +1321,45 @@ export default function App() {
     );
   }
 
+  if (screen === 'countdown') {
+    return (
+      <div className="min-h-screen flex items-center justify-center px-5 py-10">
+        <div className="w-full max-w-xl text-center">
+          <p className="text-slate-400 text-sm uppercase tracking-widest">
+            Starting interview
+          </p>
+          <div className="mt-4 text-7xl font-semibold text-teal-300 tabular-nums">
+            {countdown}
+          </div>
+          <p className="mt-4 text-slate-500">
+            Take a breath. The first question is loading.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   // INTERVIEW SCREEN
   const isWaitingForQuestion = loadingState === 'question';
   const isSubmitting = loadingState === 'feedback';
-  const hasFeedback = !!currentFeedback;
+  const isListening = isRecording && inputMode === 'voice';
+  const reviewOptions = answers
+    .map((answer, index) => (answer ? index : null))
+    .filter((value) => value !== null);
+  const activeReviewIndex = reviewOptions.includes(reviewIndex)
+    ? reviewIndex
+    : reviewOptions[reviewOptions.length - 1] ?? 0;
+  const pointersForReview =
+    feedbacks[activeReviewIndex]?.pointers || FALLBACK_POINTERS;
+  const activePointerData =
+    activePointer && activePointer.questionIndex === activeReviewIndex
+      ? pointersForReview[activePointer.pointerIndex]
+      : null;
 
   return (
     <div className="min-h-screen px-5 py-6">
       <div className="max-w-6xl mx-auto">
-        <header className="flex items-center justify-between mb-6">
+        <header className="flex items-center justify-between mb-6 flex-wrap gap-3">
           <div className="flex items-center gap-3">
             <BreathingDot />
             <div className="text-sm text-slate-300">
@@ -1082,14 +1368,36 @@ export default function App() {
                 {questionIndex + 1}
               </span>{' '}
               of {TOTAL_QUESTIONS}
+              {isPaused && (
+                <span className="ml-2 text-amber-300 text-xs uppercase tracking-widest">
+                  Paused
+                </span>
+              )}
             </div>
           </div>
-          <button
-            onClick={endSession}
-            className="text-sm text-slate-400 hover:text-slate-200 border border-slate-800/60 hover:border-slate-700 rounded-lg px-3 py-1.5 transition-colors"
-          >
-            End session
-          </button>
+          <div className="flex items-center gap-3 flex-wrap">
+            {currentQuestion && (
+              <button
+                onClick={() => speak(currentQuestion)}
+                className="text-sm text-slate-500 hover:text-slate-300"
+                title="Hear the question again"
+              >
+                Replay question
+              </button>
+            )}
+            <button
+              onClick={togglePause}
+              className="text-sm text-slate-300 hover:text-slate-100 border border-slate-800/60 hover:border-slate-700 rounded-lg px-3 py-1.5 transition-colors"
+            >
+              {isPaused ? 'Resume' : 'Pause'}
+            </button>
+            <button
+              onClick={endSession}
+              className="text-sm text-slate-400 hover:text-slate-200 border border-slate-800/60 hover:border-slate-700 rounded-lg px-3 py-1.5 transition-colors"
+            >
+              End session
+            </button>
+          </div>
         </header>
 
         {errorState && (
@@ -1102,80 +1410,120 @@ export default function App() {
           </div>
         )}
 
-        <div className="grid md:grid-cols-2 gap-5">
-          {/* LEFT: Interviewer */}
-          <div className="bg-slate-900/60 border border-slate-800/60 rounded-2xl p-6 min-h-[420px] flex flex-col">
-            <div className="text-xs uppercase tracking-widest text-slate-500 mb-3">
-              Interviewer
-            </div>
-            <div className="text-xl md:text-2xl text-slate-100 leading-relaxed min-h-[4rem]">
-              {isWaitingForQuestion && !currentQuestion ? (
-                <span className="text-slate-500">Preparing your question…</span>
-              ) : (
-                currentQuestion
-              )}
-            </div>
-
-            <div className="mt-6 flex-1 flex flex-col">
-              {inputMode === 'voice' && speechSupported ? (
-                <>
-                  <div className="flex items-center gap-4">
-                    <button
-                      onClick={toggleRecording}
-                      disabled={isSubmitting || isWaitingForQuestion}
-                      aria-pressed={isRecording}
-                      className={`w-16 h-16 rounded-full flex items-center justify-center border transition-colors ${
-                        isRecording
-                          ? 'bg-rose-500/20 border-rose-400/60 text-rose-200'
-                          : 'bg-teal-300/10 border-teal-300/40 text-teal-200 hover:bg-teal-300/20'
-                      } disabled:opacity-50`}
-                      title={isRecording ? 'Stop recording' : 'Start recording'}
+        <div className="grid lg:grid-cols-[1.2fr_0.8fr] gap-5">
+          <div className="bg-slate-900/60 border border-slate-800/60 rounded-2xl p-6 min-h-[520px] flex flex-col">
+            <div className="flex-1 space-y-4 overflow-y-auto pr-2">
+              {chatLog.map((msg) => {
+                const isCandidate = msg.role === 'candidate';
+                const isCoach = msg.role === 'coach';
+                const bubbleClass = isCandidate
+                  ? 'bg-teal-300 text-slate-900'
+                  : isCoach
+                  ? 'bg-amber-200 text-slate-900'
+                  : 'bg-slate-800/80 text-slate-100';
+                const labelClass = isCandidate
+                  ? 'text-slate-700'
+                  : isCoach
+                  ? 'text-slate-700'
+                  : 'text-slate-400';
+                const label = isCandidate
+                  ? 'You'
+                  : isCoach
+                  ? 'Coach'
+                  : 'Interviewer';
+                return (
+                  <div
+                    key={msg.id}
+                    className={`flex ${isCandidate ? 'justify-end' : 'justify-start'}`}
+                  >
+                    <div
+                      className={`max-w-[78%] rounded-2xl px-4 py-3 ${bubbleClass}`}
                     >
-                      <MicIcon on={isRecording} />
-                    </button>
-                    <div className="text-sm text-slate-400 leading-relaxed">
-                      {isRecording ? (
-                        <span className="text-rose-200">
-                          Listening — tap again to stop.
-                        </span>
-                      ) : (
-                        <span>Tap to start speaking. Take your time.</span>
-                      )}
+                      <p className={`text-[10px] uppercase tracking-widest mb-1 ${labelClass}`}>
+                        {label}
+                      </p>
+                      <p className="text-sm leading-relaxed whitespace-pre-wrap">
+                        {msg.text}
+                      </p>
                     </div>
                   </div>
+                );
+              })}
 
-                  {(isRecording || interimTranscript) && (
-                    <div className="mt-4 text-sm text-slate-400 italic min-h-[1.25rem]">
-                      {interimTranscript ? (
-                        <>
-                          <span className="text-slate-500">…</span>{' '}
-                          {interimTranscript}
-                        </>
-                      ) : (
-                        <span className="text-slate-600">
-                          Waiting for your words…
-                        </span>
-                      )}
-                    </div>
-                  )}
+              {isWaitingForQuestion && !currentQuestion && (
+                <div className="flex justify-start">
+                  <div className="rounded-2xl px-4 py-3 bg-slate-800/70 text-slate-400 text-sm">
+                    Preparing your next question...
+                  </div>
+                </div>
+              )}
 
-                  <label className="mt-5 text-xs text-slate-500">
-                    Your answer (editable)
-                  </label>
-                  <textarea
-                    value={currentAnswer}
-                    onChange={(e) => {
-                      setCurrentAnswer(e.target.value);
-                      finalTranscriptRef.current = e.target.value;
-                      if (e.target.value.trim()) setEmptyWarning(false);
-                    }}
-                    placeholder="Your transcript will appear here. Edit freely before submitting."
-                    className="mt-1 flex-1 min-h-[120px] rounded-xl bg-slate-950/60 border border-slate-800/80 focus:border-teal-400/60 focus:ring-1 focus:ring-teal-400/30 outline-none p-3 text-slate-100 leading-relaxed placeholder:text-slate-600 resize-y"
-                  />
-                </>
+              {isListening && !isPaused && (
+                <div className="flex justify-end">
+                  <div className="max-w-[78%] rounded-2xl px-4 py-3 border border-teal-300/40 bg-teal-300/10 text-teal-100">
+                    <p className="text-[10px] uppercase tracking-widest mb-1 text-teal-200/80">
+                      Listening
+                    </p>
+                    <p className="text-sm leading-relaxed">
+                      {currentAnswer || interimTranscript || '...'}
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {isSubmitting && (
+                <div className="flex justify-start">
+                  <div className="rounded-2xl px-4 py-3 bg-slate-800/70 text-slate-500 text-sm animate-pulse">
+                    Coach is typing...
+                  </div>
+                </div>
+              )}
+
+              <div ref={chatEndRef} />
+            </div>
+
+            <div className="mt-4 border-t border-slate-800/60 pt-3">
+              {speechSupported && inputMode === 'voice' ? (
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <div className="flex items-center gap-2 text-sm text-slate-400">
+                    <span
+                      className={`h-2 w-2 rounded-full ${
+                        isPaused
+                          ? 'bg-amber-300'
+                          : isListening
+                          ? 'bg-rose-400 animate-pulse'
+                          : 'bg-slate-600'
+                      }`}
+                    />
+                    {isPaused
+                      ? 'Paused - resume when ready.'
+                      : isListening
+                      ? 'Listening for your answer...'
+                      : 'Ready for your answer.'}
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <button
+                      onClick={finalizeAnswer}
+                      disabled={
+                        loadingState !== 'idle' || !currentAnswer.trim()
+                      }
+                      className="text-sm text-slate-300 hover:text-slate-100 border border-slate-800/60 hover:border-slate-700 rounded-lg px-3 py-1.5 transition-colors disabled:opacity-50"
+                    >
+                      Send now
+                    </button>
+                    <button
+                      onClick={() => {
+                        stopRecording();
+                        setInputMode('text');
+                      }}
+                      className="text-sm text-slate-500 hover:text-slate-300"
+                    >
+                      Type instead
+                    </button>
+                  </div>
+                </div>
               ) : (
-                <>
-                  <label className="text-xs text-slate-500">Your answer</label>
+                <div className="space-y-2">
                   <textarea
                     value={currentAnswer}
                     onChange={(e) => {
@@ -1183,140 +1531,114 @@ export default function App() {
                       if (e.target.value.trim()) setEmptyWarning(false);
                     }}
                     placeholder="Type your answer here."
-                    className="mt-1 flex-1 min-h-[220px] rounded-xl bg-slate-950/60 border border-slate-800/80 focus:border-teal-400/60 focus:ring-1 focus:ring-teal-400/30 outline-none p-3 text-slate-100 leading-relaxed placeholder:text-slate-600 resize-y"
+                    className="w-full min-h-[110px] rounded-xl bg-slate-950/60 border border-slate-800/80 focus:border-teal-400/60 focus:ring-1 focus:ring-teal-400/30 outline-none p-3 text-slate-100 leading-relaxed placeholder:text-slate-600 resize-y"
                   />
-                </>
+                  {emptyWarning && (
+                    <p className="text-sm text-amber-300">
+                      Add a few words first.
+                    </p>
+                  )}
+                  <div className="flex items-center justify-between">
+                    <button
+                      onClick={finalizeAnswer}
+                      disabled={loadingState !== 'idle'}
+                      className="rounded-xl bg-teal-300 hover:bg-teal-200 disabled:bg-slate-700 disabled:text-slate-400 text-slate-900 font-medium px-4 py-2"
+                    >
+                      {isSubmitting ? 'Thinking...' : 'Send answer'}
+                    </button>
+                    {speechSupported && (
+                      <button
+                        onClick={() => setInputMode('voice')}
+                        className="text-sm text-slate-500 hover:text-slate-300"
+                      >
+                        Use voice
+                      </button>
+                    )}
+                  </div>
+                </div>
               )}
-
-              {emptyWarning && (
-                <p className="mt-2 text-sm text-amber-300">
-                  Add a few words first.
-                </p>
-              )}
-
-              <div className="mt-4 flex items-center gap-3 flex-wrap">
-                <button
-                  onClick={submitAnswer}
-                  disabled={isSubmitting || isWaitingForQuestion || hasFeedback}
-                  className="rounded-xl bg-teal-300 hover:bg-teal-200 disabled:bg-slate-700 disabled:text-slate-400 text-slate-900 font-medium px-5 py-2.5 transition-colors"
-                >
-                  {isSubmitting ? 'Thinking…' : 'Submit answer'}
-                </button>
-                {speechSupported && (
-                  <button
-                    onClick={() => {
-                      if (isRecording) stopRecording();
-                      setInputMode((m) => (m === 'voice' ? 'text' : 'voice'));
-                    }}
-                    className="text-sm text-slate-400 hover:text-slate-200 underline underline-offset-4 decoration-slate-700"
-                  >
-                    {inputMode === 'voice' ? 'Type instead' : 'Voice instead'}
-                  </button>
-                )}
-                {currentQuestion && (
-                  <button
-                    onClick={() => speak(currentQuestion)}
-                    className="text-sm text-slate-500 hover:text-slate-300"
-                    title="Hear the question again"
-                  >
-                    Replay question
-                  </button>
-                )}
-              </div>
             </div>
           </div>
 
-          {/* RIGHT: Coach */}
-          <div className="bg-slate-900/60 border border-slate-800/60 rounded-2xl p-6 min-h-[420px] flex flex-col">
-            <div className="text-xs uppercase tracking-widest text-slate-500 mb-3">
-              Coach
-            </div>
-            {!hasFeedback && !isSubmitting && (
-              <div className="flex-1 flex items-center justify-center text-center">
-                <p className="text-slate-500 leading-relaxed max-w-xs">
-                  Feedback appears here after you submit. Honest, not harsh.
+          <div className="bg-slate-900/60 border border-slate-800/60 rounded-2xl p-6 min-h-[520px] flex flex-col">
+            <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+              <div>
+                <div className="text-xs uppercase tracking-widest text-slate-500">
+                  Pointers
+                </div>
+                <p className="text-xs text-slate-500">
+                  Click a bullet to expand.
                 </p>
               </div>
-            )}
-            {isSubmitting && !hasFeedback && (
-              <div className="flex-1 flex items-center justify-center text-slate-500">
-                <span className="animate-pulse">Reading your answer…</span>
+              {reviewOptions.length > 0 && (
+                <select
+                  value={activeReviewIndex}
+                  onChange={(e) => {
+                    setReviewIndex(Number(e.target.value));
+                    setActivePointer(null);
+                  }}
+                  className="rounded-lg bg-slate-950/60 border border-slate-800/80 px-2 py-1 text-xs text-slate-200"
+                >
+                  {reviewOptions.map((index) => (
+                    <option key={index} value={index}>
+                      Response {index + 1}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
+
+            {reviewOptions.length === 0 ? (
+              <div className="flex-1 flex items-center justify-center text-center">
+                <p className="text-slate-500 text-sm max-w-xs">
+                  Pointers appear after your first answer.
+                </p>
               </div>
-            )}
-            {hasFeedback && (
-              <div className="animate-fadeIn flex-1 flex flex-col">
-                {currentFeedback.raw ? (
-                  <>
-                    <p className="text-xs text-slate-500 mb-2">
-                      Feedback (unformatted)
+            ) : (
+              <div className="flex-1 flex flex-col">
+                <ul className="space-y-3">
+                  {pointersForReview.map((pointer, idx) => (
+                    <li key={`${activeReviewIndex}-${idx}`}>
+                      <button
+                        onClick={() =>
+                          setActivePointer({
+                            questionIndex: activeReviewIndex,
+                            pointerIndex: idx,
+                          })
+                        }
+                        className="w-full text-left rounded-lg px-3 py-2 border border-slate-800/80 hover:border-teal-400/60 bg-slate-950/40 text-slate-200 text-sm flex items-start gap-2"
+                      >
+                        <span className="text-teal-300 mt-[2px]">•</span>
+                        <span>{pointer.title}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+
+                {activePointerData && (
+                  <div className="mt-4 rounded-xl border border-slate-800/80 bg-slate-950/50 p-4">
+                    <div className="flex items-center justify-between mb-2">
+                      <h4 className="text-sm font-medium text-slate-100">
+                        {activePointerData.title}
+                      </h4>
+                      <button
+                        onClick={() => setActivePointer(null)}
+                        className="text-xs text-slate-500 hover:text-slate-300"
+                      >
+                        Close
+                      </button>
+                    </div>
+                    <p className="text-sm text-slate-300 leading-relaxed">
+                      {activePointerData.detail}
                     </p>
-                    <pre className="flex-1 whitespace-pre-wrap text-slate-200 text-sm leading-relaxed bg-slate-950/40 border border-slate-800/60 rounded-xl p-4 overflow-auto">
-                      {currentFeedback.raw}
-                    </pre>
-                  </>
-                ) : (
-                  <>
-                    <div className="flex items-center justify-between mb-4">
-                      <h3 className="text-slate-100 font-medium">
-                        Coaching note
-                      </h3>
-                      <div className="flex items-baseline gap-1">
-                        <span className="text-3xl font-semibold text-amber-400 tabular-nums">
-                          {currentFeedback.score}
-                        </span>
-                        <span className="text-slate-500 text-sm">/ 10</span>
-                      </div>
-                    </div>
-                    <div className="space-y-4 flex-1">
-                      <div>
-                        <div className="text-xs uppercase tracking-widest text-teal-300 mb-1">
-                          What worked
-                        </div>
-                        <p className="text-slate-200 text-sm leading-relaxed">
-                          {currentFeedback.worked}
-                        </p>
-                      </div>
-                      <div>
-                        <div className="text-xs uppercase tracking-widest text-amber-300 mb-1">
-                          What didn't
-                        </div>
-                        <p className="text-slate-200 text-sm leading-relaxed">
-                          {currentFeedback.didnt}
-                        </p>
-                      </div>
-                      <div>
-                        <div className="text-xs uppercase tracking-widest text-slate-400 mb-1">
-                          A sharper version
-                        </div>
-                        <p className="text-slate-200 text-sm leading-relaxed italic">
-                          {currentFeedback.sharper}
-                        </p>
-                      </div>
-                    </div>
-                  </>
+                  </div>
                 )}
-                <div className="mt-5 flex items-center gap-3 flex-wrap">
-                  <button
-                    onClick={onNextQuestion}
-                    disabled={loadingState !== 'idle'}
-                    className="rounded-xl bg-teal-300 hover:bg-teal-200 disabled:bg-slate-700 disabled:text-slate-400 text-slate-900 font-medium px-5 py-2.5"
-                  >
-                    {questionIndex + 1 >= TOTAL_QUESTIONS
-                      ? loadingState === 'summary'
-                        ? 'Wrapping up…'
-                        : 'See summary'
-                      : loadingState === 'question'
-                      ? 'Preparing…'
-                      : 'Next question'}
-                  </button>
-                  <button
-                    onClick={onRetryQuestion}
-                    disabled={loadingState !== 'idle'}
-                    className="text-sm text-slate-300 hover:text-slate-100 border border-slate-800/60 hover:border-slate-700 rounded-lg px-3 py-2"
-                  >
-                    Retry this question
-                  </button>
-                </div>
+
+                {!isPaused && (
+                  <p className="mt-4 text-xs text-slate-600">
+                    Pause the session anytime to review pointers in detail.
+                  </p>
+                )}
               </div>
             )}
           </div>
